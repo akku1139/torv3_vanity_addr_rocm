@@ -35,7 +35,7 @@ __global__ void vanity_search_kernel(
     uint64_t offset,
     uint64_t* data,
     uint64_t* kdata,
-    const uint8_t* patterns,
+    const gpu::BinaryPattern* patterns,
     size_t pattern_count,
     uint32_t* results_key,
     uint32_t* results_ctr
@@ -58,6 +58,42 @@ __global__ void vanity_search_kernel(
 }
 
 } // gpu
+
+int b32_to_bin(char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a';
+    if (c >= '2' && c <= '7') return c - '2' + 26;
+    return -1; // '?' 等
+}
+
+gpu::BinaryPattern pack_pattern(const std::string& s) {
+    gpu::BinaryPattern pt = {};
+    uint8_t raw[32] = {0};
+    uint8_t mask[32] = {0};
+
+    int bit_pos = 0;
+    // Max onion v3 address length
+    for (size_t i = 0; i < s.length() && i < 52; ++i) {
+        int val = b32_to_bin(s[i]);
+        bool is_wildcard = (val == -1);
+
+        for (int b = 4; b >= 0; --b) {
+            int byte_idx = bit_pos / 8;
+            int bit_idx = 7 - (bit_pos % 8);
+
+            if (byte_idx < 32) {
+                if (!is_wildcard) {
+                    if ((val >> b) & 1) raw[byte_idx] |= (1 << bit_idx);
+                    mask[byte_idx] |= (1 << bit_idx);
+                }
+            }
+            bit_pos++;
+        }
+    }
+    memcpy(pt.v, raw, 32);
+    memcpy(pt.mask, mask, 32);
+    return pt;
+}
 
 int main(int argc, char** argv)
 {
@@ -220,13 +256,24 @@ int main(int argc, char** argv)
                 uint32_t threads_per_block = 32;
                 uint32_t blocks = BATCH_SIZE / threads_per_block;
 
+                std::vector<gpu::BinaryPattern> h_binary_patterns;
+                for (size_t i = 0; i < patterns_str.length(); i += PATTERN_SIZE) {
+                    h_binary_patterns.push_back(pack_pattern(patterns_str.substr(i, PATTERN_SIZE)));
+                }
+
+                gpu::BinaryPattern* patterns;
+                CHECKED_CALL(hipMalloc((void**)&patterns, h_binary_patterns.size() * sizeof(gpu::BinaryPattern)));
+                CHECKED_CALL(hipMemcpy(patterns, h_binary_patterns.data(),
+                             h_binary_patterns.size() * sizeof(gpu::BinaryPattern),
+                             hipMemcpyHostToDevice));
+
                 gpu::vanity_search_kernel<<<blocks, threads_per_block>>>(
                     input_buf,
                     offset,
                     data,
                     kdata,
                     patterns,
-                    patterns_str.length() / PATTERN_SIZE,
+                    h_binary_patterns.size(),
                     results_key,
                     results_ctr
                 );

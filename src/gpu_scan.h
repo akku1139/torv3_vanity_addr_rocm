@@ -1,90 +1,45 @@
-
 #pragma once
+#include <cstdint>
 
 namespace gpu {
 
-__constant__ const char alphabetB32[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+struct alignas(16) BinaryPattern {
+    uint64_t v[4];
+    uint64_t mask[4];
+};
 
-__device__ void prefix_scan(const uint8_t* patterns, size_t pattern_count, const void* kdata, uint32_t* results_key, uint32_t* results_ctr)
-{
-	const uint8_t* p = reinterpret_cast<const uint8_t*>(kdata);
-	const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-	p += index * 32 * EXPAND; // keys at 32 bytes each
+__device__ void prefix_scan(
+    const BinaryPattern* d_patterns,
+    size_t pattern_count,
+    const void* kdata,
+    uint32_t* results_key,
+    uint32_t* results_ctr
+) {
+    const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint8_t* base_p = reinterpret_cast<const uint8_t*>(kdata);
 
-	int x, y, j;
-	uint64_t k, t=0;
-	const char* abc = alphabetB32;
-	uint8_t encoded_data[33];
-	for(uint32_t counter=0; counter < EXPAND; ++counter) {
-	  p += counter*32;
-	// BASE32
-	// encode 4*5 bytes from data...
-	#pragma unroll 4
-	  for(j=0; j<4; ++j)
-	  {
-	    t=0;
-	  #pragma unroll 5
-	    for(x=0, y=4; x < 5; ++x, --y)
-	    {
-	      k = p[x+(j*5)];
-	      t += k << ((+y)*8);
-	    }
-	  #pragma unroll 8
-	    for(x=0, y=7; x < 8; ++x, --y)
-	    {
-	      encoded_data[x+(j*8)] = abc[((t >> ((+y)*5)) & 0x1F)];
-	    }
-	  }
-	
-	  for (const uint8_t* ptrn = patterns, *e = patterns + pattern_count * PATTERN_SIZE; ptrn < e; ptrn += PATTERN_SIZE)
-	  {
+    const uint64_t* pub_ptr = reinterpret_cast<const uint64_t*>(base_p + (index * 32 * EXPAND));
 
-#define CHECK(index_) { const uint8_t c = ptrn[index_]; if ((c != '?') && (c != encoded_data[index_])) continue; }
-	    CHECK(0);
-	    CHECK(1);
-	    CHECK(2);
-	    CHECK(3);
-	    CHECK(4);
-	    CHECK(5);
-	    CHECK(6);
-	    CHECK(7);
-	    CHECK(8);
-	    CHECK(9);
-	    CHECK(10);
-	    CHECK(11);
-	    CHECK(12);
-	    CHECK(13);
-	    CHECK(14);
-	    CHECK(15);
-	    CHECK(16);
-	    CHECK(17);
-	    CHECK(18);
-	    CHECK(19);
-	    CHECK(20);
-	    CHECK(21);
-	    CHECK(22);
-	    CHECK(23);
-	    CHECK(24);
-	    CHECK(25);
-	    CHECK(26);
-	    CHECK(27);
-	    CHECK(28);
-	    CHECK(29);
-	    CHECK(30);
-	    CHECK(31);
-#undef CHECK
+    for (uint32_t counter = 0; counter < EXPAND; ++counter) {
+        const uint64_t* current_pub = pub_ptr + (counter * 4);
 
-	    const uint32_t k = atomicAdd(results_key, 1) + 1;
-	    if (k < 256)
-	    {
-	      results_key[k] = index;
-	      results_ctr[k] = counter;
-	      goto EIA;
-	    }
-	  }
-	}
- EIA:
-	return;
+        for (size_t i = 0; i < pattern_count; ++i) {
+            const BinaryPattern& pt = d_patterns[i];
+
+            if (((current_pub[0] & pt.mask[0]) == pt.v[0]) &&
+                ((current_pub[1] & pt.mask[1]) == pt.v[1]) &&
+                ((current_pub[2] & pt.mask[2]) == pt.v[2]) &&
+                ((current_pub[3] & pt.mask[3]) == pt.v[3]))
+            {
+                uint32_t k = atomicAdd(results_key, 1) + 1;
+                if (k < 256) {
+                    results_key[k] = index;
+                    results_ctr[k] = counter;
+                }
+                return;
+            }
+        }
+    }
 }
 
 } // gpu
