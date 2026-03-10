@@ -80,7 +80,7 @@ do { \
 	ROUND(0x0000000000000088ULL); ROUND(0x0000000080008009ULL); ROUND(0x000000008000000AULL);
 
 	if (t < 4) {
-		data[g * 4 + t] = A[t];
+		data[t] = A[t];
 	}
 }
 

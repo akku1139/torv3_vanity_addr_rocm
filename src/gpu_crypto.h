@@ -2025,16 +2025,26 @@ __device__ void ge_scalarmult_base(ge_p3* h, const unsigned char* a) {
 	}
 }
 
-__device__ void ge_p3_tobytes(unsigned char* s, const ge_p3* h) {
-	fe recip;
-	fe x;
-	fe y;
+__device__ void ge_p3_tobytes(uint64_t* out_reg, const ge_p3* h) {
+    fe recip;
+    fe t;
 
-	fe_invert(recip, h->Z);
-	fe_mul(x, h->X, recip);
-	fe_mul(y, h->Y, recip);
-	fe_tobytes(s, y);
-	s[31] ^= fe_isnegative(x) << 7;
+    fe_invert(recip, h->Z);
+
+    fe_mul(t, h->Y, recip);
+
+    uint8_t temp_s[32];
+    fe_tobytes(temp_s, t);
+
+    fe_mul(t, h->X, recip);
+
+    temp_s[31] ^= fe_isnegative(t) << 7;
+
+    const uint64_t* packed = reinterpret_cast<const uint64_t*>(temp_s);
+    out_reg[0] = packed[0];
+    out_reg[1] = packed[1];
+    out_reg[2] = packed[2];
+    out_reg[3] = packed[3];
 }
 
 __device__ void reduce(void* data)
@@ -2042,57 +2052,6 @@ __device__ void reduce(void* data)
 	uint8_t* s = reinterpret_cast<uint8_t*>(data);
 	const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
 	sc_reduce32(s + index * 32);
-}
-
-__device__ void gen_public_keys_primary(void* data, void* kdata)
-{
-        uint8_t* p = reinterpret_cast<uint8_t*>(data);
-	uint8_t* k = reinterpret_cast<uint8_t*>(kdata);
-	const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-	p += index * 32;
-	k += index * 32 * EXPAND; // keys at 32bytes each
-
-	ge_p3 point;
-	ge_scalarmult_base(&point, p);
-
-	ge_p1p1 sum;
-
-	// Implementation Note
-	// we do addition on the curve to generate more public key candidates without having to do the costly
-	// scalar mult, greatly expanding how fast and how many candidates can generate on a kernel pass.
-	// this works because the followig holds for EC points (A,B) on the curve for base point G :
-	// (A+B)*G = AG + BG
- 
-	// TODO: add a tuning loop for the EXPAND value relative to the amount of VRAM available
-	for(uint32_t slot=0; slot < EXPAND; ++slot) {
-	  ge_add(&sum, &point, &ge_eightpoint);
-	  ge_p1p1_to_p3(&point, &sum);
-	  k += slot * 32;
-	  ge_p3_tobytes(k, &point);
-	}
-}
-
- //TODO: Secondary will reuse and extend off the last value generated in secondary with the same addition expansion
-  // and feed back into the same buffer
-  __device__ void gen_public_keys_secondary(void* data, void* kdata)
-{
-        uint8_t* p = reinterpret_cast<uint8_t*>(data);
-	uint8_t* k = reinterpret_cast<uint8_t*>(kdata);
-	const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
-	p += index * 32;
-	k += index * 32 * EXPAND; // keys at 32bytes each
-
-	ge_p3 point;
-	ge_scalarmult_base(&point, p);
-
-	ge_p1p1 sum;
-
-	for(uint32_t slot=0; slot < EXPAND; ++slot) {
-	  ge_add(&sum, &point, &ge_eightpoint);
-	  ge_p1p1_to_p3(&point, &sum);
-	  k += slot * 32;
-	  ge_p3_tobytes(k, &point);
-	}
 }
 
 } // gpu

@@ -13,8 +13,6 @@
 #define EXPANDBUF 4096
 #include "gpu_keccak.h"
 #include "gpu_crypto.h"
-
-constexpr size_t PATTERN_SIZE = 32;
 #include "gpu_scan.h"
 
 extern "C" {
@@ -25,36 +23,64 @@ extern "C" {
 using namespace std::chrono;
 
 constexpr char alphabet32[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-
 constexpr size_t BATCH_SIZE = 1 << 20;
+constexpr size_t PATTERN_SIZE = 32;
+constexpr uint32_t THREADS_PER_BLOCK = 32;
 
 namespace gpu {
 
 __global__ void vanity_search_kernel(
     const uint8_t* input_buf,
     uint64_t offset,
-    uint64_t* data,
-    uint64_t* kdata,
     const gpu::BinaryPattern* patterns,
     size_t pattern_count,
     uint32_t* results_key,
     uint32_t* results_ctr
 ) {
-    if (blockIdx.x == 0 && threadIdx.x == 0) {
-        results_key[0] = 0;
+    const uint32_t t = threadIdx.x;
+    const uint32_t g = blockIdx.x;
+    const uint32_t global_idx = g * blockDim.x + t;
+
+    __shared__ uint64_t shared_priv[4];
+    gpu::keccak_12_rounds(input_buf, 32, offset + g, shared_priv);
+    __syncthreads();
+
+    ge_p3 point;
+    ge_scalarmult_base(&point, reinterpret_cast<uint8_t*>(shared_priv));
+
+    for (int i = 0; i < t; ++i) {
+        ge_p1p1 tmp_sum;
+        ge_add(&tmp_sum, &point, &ge_eightpoint);
+        ge_p1p1_to_p3(&point, &tmp_sum);
     }
-    __syncthreads();
 
-    gpu::keccak_12_rounds(input_buf, 32, offset, data);
-    __syncthreads();
+    for (uint32_t counter = 0; counter < EXPAND; ++counter) {
+        uint64_t current_pub[4];
+        gpu::ge_p3_tobytes(current_pub, &point);
 
-    gpu::reduce(data);
-    __syncthreads();
+        for (size_t i = 0; i < pattern_count; ++i) {
+            const gpu::BinaryPattern& pt = patterns[i];
+            if (((current_pub[0] & pt.mask[0]) == pt.v[0]) &&
+                ((current_pub[1] & pt.mask[1]) == pt.v[1]) &&
+                ((current_pub[2] & pt.mask[2]) == pt.v[2]) &&
+                ((current_pub[3] & pt.mask[3]) == pt.v[3])) {
+                uint32_t k = atomicAdd(results_key, 1) + 1;
+                if (k < 256) {
+                    results_key[k] = global_idx;
+                    results_ctr[k] = counter;
+                }
+            }
+        }
 
-    gpu::gen_public_keys_primary(data, kdata);
-    __syncthreads();
-
-    gpu::prefix_scan(patterns, pattern_count, kdata, results_key, results_ctr);
+        // 次の点は「32スレッド分」飛ばす (32 * 8 = 256)
+        // ここで ge_256point (ge_eightpointを32回足したもの) を使うと爆速
+        // とりあえずは ge_eightpoint を 32回足すループでも動作は正確
+        for (int step = 0; step < 32; ++step) {
+            ge_p1p1 sum;
+            ge_add(&sum, &point, &ge_eightpoint);
+            ge_p1p1_to_p3(&point, &sum);
+        }
+    }
 }
 
 } // gpu
@@ -63,7 +89,7 @@ int b32_to_bin(char c) {
     if (c >= 'A' && c <= 'Z') return c - 'A';
     if (c >= 'a' && c <= 'z') return c - 'a';
     if (c >= '2' && c <= '7') return c - '2' + 26;
-    return -1; // '?' 等
+    return -1;
 }
 
 gpu::BinaryPattern pack_pattern(const std::string& s) {
@@ -235,12 +261,6 @@ int main(int argc, char** argv)
             CHECKED_CALL(hipMalloc((void**)&input_buf, 32));
             CHECKED_CALL(hipMemcpy(input_buf, key_template, sizeof(key_template), hipMemcpyHostToDevice));
 
-            uint64_t* data;
-            CHECKED_CALL(hipMalloc((void**)&data, BATCH_SIZE * 32));
-	    
-            uint64_t* kdata;
-            CHECKED_CALL(hipMalloc((void**)&kdata, BATCH_SIZE * EXPANDBUF));
-
             uint8_t* patterns;
             CHECKED_CALL(hipMalloc((void**)&patterns, patterns_str.length()));
             CHECKED_CALL(hipMemcpy(patterns, patterns_str.data(), patterns_str.length(), hipMemcpyHostToDevice));
@@ -253,8 +273,7 @@ int main(int argc, char** argv)
             for (uint64_t offset = 0;; offset += BATCH_SIZE) {
                 CHECKED_CALL(hipMemset(results_key, 0, sizeof(uint32_t)));
 
-                uint32_t threads_per_block = 32;
-                uint32_t blocks = BATCH_SIZE / threads_per_block;
+                uint32_t blocks = BATCH_SIZE / THREADS_PER_BLOCK;
 
                 std::vector<gpu::BinaryPattern> h_binary_patterns;
                 for (size_t i = 0; i < patterns_str.length(); i += PATTERN_SIZE) {
@@ -267,11 +286,9 @@ int main(int argc, char** argv)
                              h_binary_patterns.size() * sizeof(gpu::BinaryPattern),
                              hipMemcpyHostToDevice));
 
-                gpu::vanity_search_kernel<<<blocks, threads_per_block>>>(
+                gpu::vanity_search_kernel<<<blocks, THREADS_PER_BLOCK>>>(
                     input_buf,
                     offset,
-                    data,
-                    kdata,
                     patterns,
                     h_binary_patterns.size(),
                     results_key,
