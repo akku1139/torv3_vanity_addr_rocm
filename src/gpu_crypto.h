@@ -2037,14 +2037,14 @@ __device__ void ge_p3_tobytes(unsigned char* s, const ge_p3* h) {
 	s[31] ^= fe_isnegative(x) << 7;
 }
 
-__global__ void reduce(void* data)
+__device__ void reduce(void* data)
 {
 	uint8_t* s = reinterpret_cast<uint8_t*>(data);
 	const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;
 	sc_reduce32(s + index * 32);
 }
 
-__global__ void gen_public_keys_primary(void* data, void* kdata)
+__device__ void gen_public_keys_primary(void* data, void* kdata)
 {
         uint8_t* p = reinterpret_cast<uint8_t*>(data);
 	uint8_t* k = reinterpret_cast<uint8_t*>(kdata);
@@ -2074,7 +2074,7 @@ __global__ void gen_public_keys_primary(void* data, void* kdata)
 
  //TODO: Secondary will reuse and extend off the last value generated in secondary with the same addition expansion
   // and feed back into the same buffer
-  __global__ void gen_public_keys_secondary(void* data, void* kdata)
+  __device__ void gen_public_keys_secondary(void* data, void* kdata)
 {
         uint8_t* p = reinterpret_cast<uint8_t*>(data);
 	uint8_t* k = reinterpret_cast<uint8_t*>(kdata);

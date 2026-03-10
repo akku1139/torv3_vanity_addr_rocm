@@ -37,7 +37,7 @@ do { \
 } while (0)
   
 // we diffuse the randomness GPU side to avoid leaking the computation through EM noise
-  __global__ void __launch_bounds__(32) keccak_12_rounds(const uint8_t* input_data, uint32_t input_size, uint64_t offset, uint64_t* data)
+  __device__ void keccak_12_rounds(const uint8_t* input_data, uint32_t input_size, uint64_t offset, uint64_t* data)
 {
 	const uint32_t t = threadIdx.x;
 	const uint32_t g = blockIdx.x;

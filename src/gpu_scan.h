@@ -5,7 +5,7 @@ namespace gpu {
 
 __constant__ const char alphabetB32[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 
-__global__ void prefix_scan(const uint8_t* patterns, size_t pattern_count, const void* kdata, uint32_t* results_key, uint32_t* results_ctr)
+__device__ void prefix_scan(const uint8_t* patterns, size_t pattern_count, const void* kdata, uint32_t* results_key, uint32_t* results_ctr)
 {
 	const uint8_t* p = reinterpret_cast<const uint8_t*>(kdata);
 	const uint32_t index = blockIdx.x * blockDim.x + threadIdx.x;

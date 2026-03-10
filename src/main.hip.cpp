@@ -28,6 +28,37 @@ constexpr char alphabet32[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVW
 
 constexpr size_t BATCH_SIZE = 1 << 20;
 
+namespace gpu {
+
+__global__ void vanity_search_kernel(
+    const uint8_t* input_buf,
+    uint64_t offset,
+    uint64_t* data,
+    uint64_t* kdata,
+    const uint8_t* patterns,
+    size_t pattern_count,
+    uint32_t* results_key,
+    uint32_t* results_ctr
+) {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        results_key[0] = 0;
+    }
+    __syncthreads();
+
+    gpu::keccak_12_rounds(input_buf, 32, offset, data);
+    __syncthreads();
+
+    gpu::reduce(data);
+    __syncthreads();
+
+    gpu::gen_public_keys_primary(data, kdata);
+    __syncthreads();
+
+    gpu::prefix_scan(patterns, pattern_count, kdata, results_key, results_ctr);
+}
+
+} // gpu
+
 int main(int argc, char** argv)
 {
 #define CHECKED_CALL(X) do { \
@@ -186,20 +217,20 @@ int main(int argc, char** argv)
             for (uint64_t offset = 0;; offset += BATCH_SIZE) {
                 CHECKED_CALL(hipMemset(results_key, 0, sizeof(uint32_t)));
 
-                gpu::keccak_12_rounds<<<BATCH_SIZE, 32>>>(input_buf, 32, offset, data);
-                CHECKED_CALL(hipGetLastError());
-		
-                gpu::reduce<<<BATCH_SIZE / 32, 32>>>(data);
-                CHECKED_CALL(hipGetLastError());
-		
-                gpu::gen_public_keys_primary<<<BATCH_SIZE / 32, 32>>>(data, kdata);
-                CHECKED_CALL(hipGetLastError());
+                uint32_t threads_per_block = 32;
+                uint32_t blocks = BATCH_SIZE / threads_per_block;
 
-		// TODO: add in a conditional to switch to this kernel the majority of the time once Primary has run at least once
-		//gpu::gen_public_keys_secondary<<<BATCH_SIZE / 32, 32>>>(data, kdata);
-                //CHECKED_CALL(hipGetLastError());
+                gpu::vanity_search_kernel<<<blocks, threads_per_block>>>(
+                    input_buf,
+                    offset,
+                    data,
+                    kdata,
+                    patterns,
+                    patterns_str.length() / PATTERN_SIZE,
+                    results_key,
+                    results_ctr
+                );
 
-                gpu::prefix_scan<<<BATCH_SIZE / 32, 32>>>(patterns, patterns_str.length() / PATTERN_SIZE, kdata, results_key, results_ctr);
                 CHECKED_CALL(hipGetLastError());
 
                 CHECKED_CALL(hipDeviceSynchronize());
