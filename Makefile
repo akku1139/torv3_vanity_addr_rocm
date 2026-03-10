@@ -7,4 +7,4 @@ endif
 TARGET := vanity_torv3_rocm-$(ARCH)
 
 $(TARGET): $(SRC)
-	hipcc -O3 --offload-arch=$(ARCH) $^ -o $@
+	hipcc -O3 -flto -DNDEBUG --offload-arch=$(ARCH) $^ -o $@
