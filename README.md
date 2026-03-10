@@ -22,7 +22,7 @@ A folder called `generated-<timestamp>` will be generated
 
 ## Performance
 
-This generator can check ~4.7 million keys/second on a single Radeon RX 6700 XT. (Core i7-4770S+mkp224o=14.6M kps)
+This generator can check ~39.3 million keys/second on a single Radeon RX 6700 XT. (Core i7-4770S+mkp224o=14.6M kps)
 Multiple patterns don't slow down the search.
 Max pattern prefix search length is 32 characters to allow offset searching ie. `????wink??????test???`
 Anything beyond 12 characters will probably take a few hundred years...
@@ -34,5 +34,5 @@ abcdefghijklmnopqrstuvwxyz234567
 ## Build instructions
 
 ```
-make ARCH=gfx1030
+make ARCH=gfx1030 EXPAND=100
 ```

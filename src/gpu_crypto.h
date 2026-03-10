@@ -2054,4 +2054,66 @@ __device__ void reduce(void* data)
 	sc_reduce32(s + index * 32);
 }
 
+__device__ void fe_internal_copy(int32_t *dst, const int32_t *src) {
+    #pragma unroll
+    for(int i = 0; i < 10; ++i) dst[i] = src[i];
+}
+
+__device__ void fe_shfl(int32_t *res, const int32_t *val, int src_lane) {
+    #pragma unroll
+    for(int i = 0; i < 10; ++i) res[i] = __shfl(val[i], src_lane);
+}
+
+__device__ void fe_shfl_up(int32_t *res, const int32_t *val, uint32_t delta) {
+    #pragma unroll
+    for(int i = 0; i < 10; ++i) res[i] = __shfl_up(val[i], delta);
+}
+
+__device__ void fe_shfl_down(int32_t *res, const int32_t *val, uint32_t delta) {
+    #pragma unroll
+    for(int i = 0; i < 10; ++i) res[i] = __shfl_down(val[i], delta);
+}
+
+__device__ void batch_invert_64_shfl(fe r1, fe r2, const fe z1, const fe z2) {
+    const uint32_t t = threadIdx.x % 32;
+
+    fe local_prod;
+    fe_mul(local_prod, z1, z2);
+
+    fe s;
+    fe_internal_copy(s, local_prod);
+    #pragma unroll
+    for (int i = 1; i < 32; i <<= 1) {
+        fe remote;
+        fe_shfl_up(remote, s, i);
+        if (t >= i) fe_mul(s, s, remote);
+    }
+
+    fe inv_all;
+    fe_shfl(inv_all, s, 31);
+    fe_invert(inv_all, inv_all);
+
+    fe p;
+    fe_internal_copy(p, local_prod);
+    #pragma unroll
+    for (int i = 1; i < 32; i <<= 1) {
+        fe remote;
+        fe_shfl_down(remote, p, i);
+        if (t + i < 32) fe_mul(p, p, remote);
+    }
+
+    // I_batch_i = inv_all * s_{i-1} * p_{i+1}
+    fe inv_pair;
+    fe_internal_copy(inv_pair, inv_all);
+    fe tmp;
+    fe_shfl_up(tmp, s, 1);
+    if (t > 0) fe_mul(inv_pair, inv_pair, tmp);
+    fe_shfl_down(tmp, p, 1);
+    if (t < 31) fe_mul(inv_pair, inv_pair, tmp);
+
+    // r1 = inv_pair * z2, r2 = inv_pair * z1
+    fe_mul(r1, inv_pair, z2);
+    fe_mul(r2, inv_pair, z1);
+}
+
 } // gpu

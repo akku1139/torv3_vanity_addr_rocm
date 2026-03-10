@@ -10,8 +10,6 @@
 #include <vector>
 #include "hip/hip_runtime.h"
 #include "keccak.h"
-#define EXPAND 10
-#define EXPANDBUF 4096
 #include "gpu_keccak.h"
 #include "gpu_crypto.h"
 #include "gpu_scan.h"
@@ -32,6 +30,7 @@ namespace gpu {
 
 __device__ ge_cached d_precomputed_steps[32];
 __device__ ge_cached d_stride_8_32;
+__device__ ge_cached d_stride_512;
 
 const fe fe_d2 = {-21827239, -5839606, -30745221, 13898782, 229458, 15978800, -12551817, -6495438, 29715968, 9444199}; /* 2 * d */
 
@@ -63,6 +62,16 @@ __global__ void init_step_tables_kernel() {
         }
 
         ge_p3_to_cached(&d_stride_8_32, &p3_current);
+
+        ge_p3 p512;
+        ge_cached cached_stride;
+        ge_p3_to_cached(&cached_stride, &p3_current);
+
+        ge_add(&sum, &p3_current, &cached_stride);    // 256 + 256
+        ge_p1p1_to_p3(&p512, &sum);
+
+        ge_p3_to_cached(&d_stride_512, &p512);
+
     }
 }
 
@@ -74,42 +83,65 @@ __global__ void vanity_search_kernel(
     uint32_t* results_key,
     uint32_t* results_ctr
 ) {
-    const uint32_t t = threadIdx.x;
+    const uint32_t t = threadIdx.x % 32;
     const uint32_t g = blockIdx.x;
 
     __shared__ uint64_t shared_priv[4];
     gpu::keccak_12_rounds(input_buf, 32, offset + g, shared_priv);
     __syncthreads();
 
-    ge_p3 point;
-    ge_scalarmult_base(&point, reinterpret_cast<uint8_t*>(shared_priv));
+    ge_p3 p1, p2;
+    ge_scalarmult_base(&p1, reinterpret_cast<uint8_t*>(shared_priv));
 
-    ge_p1p1 sum;
-    ge_add(&sum, &point, &d_precomputed_steps[t]);
-    ge_p1p1_to_p3(&point, &sum);
+    ge_p1p1 sum_init;
+    ge_add(&sum_init, &p1, &gpu::d_precomputed_steps[t]);
+    ge_p1p1_to_p3(&p1, &sum_init);
 
-    for (uint32_t counter = 0; counter < EXPAND; ++counter) {
-        uint64_t current_pub[4];
+    ge_add(&sum_init, &p1, &gpu::d_stride_8_32);
+    ge_p1p1_to_p3(&p2, &sum_init);
 
-        gpu::ge_p3_tobytes(current_pub, &point);
+    for (uint32_t counter = 0; counter < EXPAND / 2; ++counter) {
+        fe inv_z1, inv_z2;
+        batch_invert_64_shfl(inv_z1, inv_z2, p1.Z, p2.Z);
 
-        for (size_t i = 0; i < pattern_count; ++i) {
-            const gpu::BinaryPattern& pt = patterns[i];
-            if (((current_pub[0] & pt.mask[0]) == pt.v[0]) &&
-                ((current_pub[1] & pt.mask[1]) == pt.v[1]) &&
-                ((current_pub[2] & pt.mask[2]) == pt.v[2]) &&
-                ((current_pub[3] & pt.mask[3]) == pt.v[3]))
-            {
-                uint32_t k = atomicAdd(results_key, 1) + 1;
-                if (k < 256) {
-                    results_key[k] = g * 32 + t; // global_idx
-                    results_ctr[k] = counter;
+        #pragma unroll
+        for (int step = 0; step < 2; ++step) {
+            ge_p3* current_p = (step == 0) ? &p1 : &p2;
+            fe* current_inv = (step == 0) ? &inv_z1 : &inv_z2;
+
+            fe x, y;
+            fe_mul(y, current_p->Y, *current_inv);
+            fe_mul(x, current_p->X, *current_inv);
+
+            uint8_t temp_s[32];
+            fe_tobytes(temp_s, y);
+            temp_s[31] ^= fe_isnegative(x) << 7;
+
+            const uint64_t* packed = reinterpret_cast<const uint64_t*>(temp_s);
+            uint64_t current_pub[4];
+            current_pub[0] = packed[0]; current_pub[1] = packed[1];
+            current_pub[2] = packed[2]; current_pub[3] = packed[3];
+
+            for (size_t i = 0; i < pattern_count; ++i) {
+                const gpu::BinaryPattern& pt = patterns[i];
+                if (((current_pub[0] & pt.mask[0]) == pt.v[0]) &&
+                    ((current_pub[1] & pt.mask[1]) == pt.v[1]) &&
+                    ((current_pub[2] & pt.mask[2]) == pt.v[2]) &&
+                    ((current_pub[3] & pt.mask[3]) == pt.v[3]))
+                {
+                    uint32_t k = atomicAdd(results_key, 1) + 1;
+                    if (k < 256) {
+                        results_key[k] = (g * 32 + t) | (step << 31);
+                        results_ctr[k] = counter;
+                    }
                 }
             }
         }
 
-        ge_add(&sum, &point, &d_stride_8_32);
-        ge_p1p1_to_p3(&point, &sum);
+        ge_add(&sum_init, &p1, &gpu::d_stride_512);
+        ge_p1p1_to_p3(&p1, &sum_init);
+        ge_add(&sum_init, &p2, &gpu::d_stride_512);
+        ge_p1p1_to_p3(&p2, &sum_init);
     }
 }
 
@@ -149,6 +181,43 @@ gpu::BinaryPattern pack_pattern(const std::string& s) {
     memcpy(pt.v, raw, 32);
     memcpy(pt.mask, mask, 32);
     return pt;
+}
+
+void recover_and_print_key(
+    uint32_t key_info,
+    uint32_t counter,
+    uint64_t offset,
+    const uint8_t* key_template_base
+) {
+    uint32_t step = (key_info >> 31);
+    uint32_t global_idx = (key_info & 0x7FFFFFFF);
+    uint32_t g = global_idx / 32;
+    uint32_t t = global_idx % 32;
+
+    uint8_t seed[32];
+    uint8_t base_priv[32];
+    uint64_t current_seed_offset = offset + g;
+
+    uint8_t local_template[32];
+    memcpy(local_template, key_template_base, 32);
+    *((uint64_t*)local_template) ^= current_seed_offset;
+    keccak(local_template, 32, base_priv, 32, 12);
+    sc_reduce32(base_priv);
+
+    uint32_t total_steps = t + (step * 32) + (counter * 64);
+    uint32_t incr = total_steps * 8;
+
+    uint8_t fixup[32];
+    memset(fixup, 0, 32);
+    memcpy(fixup, &incr, sizeof(incr));
+
+    uint8_t final_priv[32];
+    scalar_add(final_priv, base_priv, fixup);
+
+    for (int j = 0; j < 32; ++j) {
+        printf("%02x", final_priv[j]);
+    }
+    printf("\n");
 }
 
 int main(int argc, char** argv)
@@ -333,46 +402,13 @@ int main(int argc, char** argv)
                 CHECKED_CALL(hipMemcpy(results_key_host, results_key, sizeof(results_key_host), hipMemcpyDeviceToHost));
                 uint32_t results_ctr_host[256];
                 CHECKED_CALL(hipMemcpy(results_ctr_host, results_ctr, sizeof(results_ctr_host), hipMemcpyDeviceToHost));
-		
-		uint32_t counter = 0;
-                for (uint32_t i = 1, n = std::min(255u, results_key_host[0]); i <= n; ++i) {
-                    uint8_t buf[32];
-		    counter = results_ctr_host[i];
 
-		    *((uint64_t*)key_template) ^= offset + results_key_host[i];
-		    keccak(key_template, 32, buf, 32, 12);
-		    *((uint64_t*)key_template) ^= offset + results_key_host[i];
-
-                    sc_reduce32(buf);
-
-                    uint8_t tor_secret_key[32];
-		    uint8_t tor_secret_key_[32];
-		    
-                    memcpy(tor_secret_key, buf, 32);
-		    uint8_t fixup[32];
-		    memset(fixup, 0, 32);
-		    
-		    uint32_t incr = (counter+1) * 8;
-		    memcpy(fixup, &incr, sizeof(incr));
-		      
-		    scalar_add(tor_secret_key_,tor_secret_key, fixup);
-
-                    uint8_t encoded_tor_secret_key[65];
-                    for (int j = 0; j < 32; ++j) {
-                        encoded_tor_secret_key[j * 2    ] = "0123456789abcdef"[tor_secret_key_[j] >> 4];
-                        encoded_tor_secret_key[j * 2 + 1] = "0123456789abcdef"[tor_secret_key_[j] & 15];
-		    }
-                    encoded_tor_secret_key[64] = '\0';
-		    
-		    //std::cout << encoded_tor_secret_key << " " << n << " " << i << std::endl;
-		    // probably logic error on my part, but will filter out 99% of false-positives vs speed
-		    if(n == i) {
-		      std::cout << encoded_tor_secret_key << std::endl;
-		    }
-		    
+                uint32_t num_results = std::min(255u, results_key_host[0]);
+                for (uint32_t i = 1; i <= num_results; ++i) {
+                    recover_and_print_key(results_key_host[i], results_ctr_host[i], offset, key_template);
                 }
 
-                keys_checked += BATCH_SIZE; // for every key we generate we expand it
+                keys_checked += (uint64_t)blocks * THREADS_PER_BLOCK * EXPAND; // for every key we generate we expand it
             }
         });
     }
