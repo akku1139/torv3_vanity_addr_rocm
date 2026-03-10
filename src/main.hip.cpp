@@ -7,6 +7,7 @@
 #include <thread>
 #include <atomic>
 #include <set>
+#include <vector>
 #include "hip/hip_runtime.h"
 #include "keccak.h"
 #define EXPAND 10
@@ -29,6 +30,42 @@ constexpr uint32_t THREADS_PER_BLOCK = 32;
 
 namespace gpu {
 
+__device__ ge_cached d_precomputed_steps[32];
+__device__ ge_cached d_stride_8_32;
+
+const fe fe_d2 = {-21827239, -5839606, -30745221, 13898782, 229458, 15978800, -12551817, -6495438, 29715968, 9444199}; /* 2 * d */
+
+__device__ void ge_p3_to_cached(ge_cached *r, const ge_p3 *p) {
+    fe_add(r->YplusX, p->Y, p->X);
+    fe_sub(r->YminusX, p->Y, p->X);
+    fe_copy(r->Z, p->Z);
+
+    fe_mul(r->T2d, p->T, fe_d2);
+}
+
+__global__ void init_step_tables_kernel() {
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        ge_p3 p3_current;
+        ge_p1p1 sum;
+
+        ge_p3 identity;
+        fe_0(identity.X); fe_1(identity.Y); fe_1(identity.Z); fe_0(identity.T);
+        ge_p3_to_cached(&d_precomputed_steps[0], &identity);
+
+        ge_add(&sum, &identity, &ge_eightpoint);
+        ge_p1p1_to_p3(&p3_current, &sum);
+
+        for (int i = 1; i < 32; ++i) {
+            ge_p3_to_cached(&d_precomputed_steps[i], &p3_current);
+
+            ge_add(&sum, &p3_current, &ge_eightpoint);
+            ge_p1p1_to_p3(&p3_current, &sum);
+        }
+
+        ge_p3_to_cached(&d_stride_8_32, &p3_current);
+    }
+}
+
 __global__ void vanity_search_kernel(
     const uint8_t* input_buf,
     uint64_t offset,
@@ -39,7 +76,6 @@ __global__ void vanity_search_kernel(
 ) {
     const uint32_t t = threadIdx.x;
     const uint32_t g = blockIdx.x;
-    const uint32_t global_idx = g * blockDim.x + t;
 
     __shared__ uint64_t shared_priv[4];
     gpu::keccak_12_rounds(input_buf, 32, offset + g, shared_priv);
@@ -48,14 +84,13 @@ __global__ void vanity_search_kernel(
     ge_p3 point;
     ge_scalarmult_base(&point, reinterpret_cast<uint8_t*>(shared_priv));
 
-    for (int i = 0; i < t; ++i) {
-        ge_p1p1 tmp_sum;
-        ge_add(&tmp_sum, &point, &ge_eightpoint);
-        ge_p1p1_to_p3(&point, &tmp_sum);
-    }
+    ge_p1p1 sum;
+    ge_add(&sum, &point, &d_precomputed_steps[t]);
+    ge_p1p1_to_p3(&point, &sum);
 
     for (uint32_t counter = 0; counter < EXPAND; ++counter) {
         uint64_t current_pub[4];
+
         gpu::ge_p3_tobytes(current_pub, &point);
 
         for (size_t i = 0; i < pattern_count; ++i) {
@@ -63,23 +98,18 @@ __global__ void vanity_search_kernel(
             if (((current_pub[0] & pt.mask[0]) == pt.v[0]) &&
                 ((current_pub[1] & pt.mask[1]) == pt.v[1]) &&
                 ((current_pub[2] & pt.mask[2]) == pt.v[2]) &&
-                ((current_pub[3] & pt.mask[3]) == pt.v[3])) {
+                ((current_pub[3] & pt.mask[3]) == pt.v[3]))
+            {
                 uint32_t k = atomicAdd(results_key, 1) + 1;
                 if (k < 256) {
-                    results_key[k] = global_idx;
+                    results_key[k] = g * 32 + t; // global_idx
                     results_ctr[k] = counter;
                 }
             }
         }
 
-        // 次の点は「32スレッド分」飛ばす (32 * 8 = 256)
-        // ここで ge_256point (ge_eightpointを32回足したもの) を使うと爆速
-        // とりあえずは ge_eightpoint を 32回足すループでも動作は正確
-        for (int step = 0; step < 32; ++step) {
-            ge_p1p1 sum;
-            ge_add(&sum, &point, &ge_eightpoint);
-            ge_p1p1_to_p3(&point, &sum);
-        }
+        ge_add(&sum, &point, &d_stride_8_32);
+        ge_p1p1_to_p3(&point, &sum);
     }
 }
 
