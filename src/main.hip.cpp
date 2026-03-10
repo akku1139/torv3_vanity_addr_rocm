@@ -1,4 +1,5 @@
-﻿
+#include "hip/hip_runtime.h"
+
 #include <iostream>
 #include <cstdint>
 #include <random>
@@ -6,8 +7,7 @@
 #include <thread>
 #include <atomic>
 #include <set>
-#include "cuda_runtime.h"
-#include "device_launch_parameters.h"
+#include "hip/hip_runtime.h"
 #include "keccak.h"
 #define EXPAND 10
 #define EXPANDBUF 4096
@@ -19,6 +19,7 @@ constexpr size_t PATTERN_SIZE = 32;
 
 extern "C" {
 #include "crypto-ops.h"
+#include <string.h>
 }
 
 using namespace std::chrono;
@@ -30,15 +31,15 @@ constexpr size_t BATCH_SIZE = 1 << 20;
 int main(int argc, char** argv)
 {
 #define CHECKED_CALL(X) do { \
-        const cudaError_t err = X; \
-        if (err != cudaSuccess) { \
+        const hipError_t err = X; \
+        if (err != hipSuccess) { \
             std::cerr << #X " (line " << __LINE__ << ") failed, error " << err; \
             return __LINE__; \
         } \
     } while(0)
 
     int device_count;
-    CHECKED_CALL(cudaGetDeviceCount(&device_count));
+    CHECKED_CALL(hipGetDeviceCount(&device_count));
     
     bool rate_info = false;
     
@@ -108,13 +109,14 @@ int main(int argc, char** argv)
     if (patterns_str.empty()) {
         printf(
             "Usage:\n\n"
-            "./vanity_torv3_cuda [-d N] pattern1 [pattern_2] [pattern_3] ... [pattern_n]\n\n"
+            "%s [-d N] pattern1 [pattern_2] [pattern_3] ... [pattern_n]\n\n"
 	    "-i         will print out the hashrate every 20 seconds if flag set\n\n"
-            "-d N       use CUDA device with index N (counting from 0). This argument can be repeated multiple times with different N.\n\n"
+            "-d N       use ROCm device with index N (counting from 0). This argument can be repeated multiple times with different N.\n\n"
             "Each pattern can have \"?\" symbols which match any character.\nOnly the following characters are allowed:\n\n abcdefghijklmnopqrstuvwxyz234567\n\n"
-            "Example:\n\t./vanity_torv3_cuda P?XXXXX L23456 b55555 FfFfFf H99999\n\n"
+            "Example:\n\t%s P?XXXXX L23456 b55555 FfFfFf H99999\n\n"
             "If the vanity generator finds a match, it will print the secret key as it's running.\n"
-            "These can be appended by 32bytes of secure randomness to make a torv3 key file.\n\n"
+            "These can be appended by 32bytes of secure randomness to make a torv3 key file.\n\n",
+            argv[0], argv[0]
         );
         return 0;
     }
@@ -141,15 +143,15 @@ int main(int argc, char** argv)
             continue;
         }
 
-        cudaDeviceProp prop;
-        CHECKED_CALL(cudaGetDeviceProperties(&prop, i));
-	std::cout << "Using CUDA device " << i << ": " << prop.name << std::endl;
+        hipDeviceProp_t prop;
+        CHECKED_CALL(hipGetDeviceProperties(&prop, i));
+	std::cout << "Using ROCm device " << i << ": " << prop.name << std::endl;
 
         threads.emplace_back([i, &rnd_buf, &patterns_str, &keys_checked]()
         {
-            CHECKED_CALL(cudaSetDevice(i));
+            CHECKED_CALL(hipSetDevice(i));
 
-            CHECKED_CALL(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+            CHECKED_CALL(hipSetDeviceFlags(hipDeviceScheduleBlockingSync));
 
             // Mix entropy into 32-byte secret key template
             uint8_t tmp_buf[sizeof(rnd_buf)];
@@ -163,49 +165,49 @@ int main(int argc, char** argv)
             keccak(tmp_buf, sizeof(tmp_buf), key_template, sizeof(key_template), 24);
 
             uint8_t* input_buf;
-            CHECKED_CALL(cudaMalloc((void**)&input_buf, 32));
-            CHECKED_CALL(cudaMemcpy(input_buf, key_template, sizeof(key_template), cudaMemcpyHostToDevice));
+            CHECKED_CALL(hipMalloc((void**)&input_buf, 32));
+            CHECKED_CALL(hipMemcpy(input_buf, key_template, sizeof(key_template), hipMemcpyHostToDevice));
 
             uint64_t* data;
-            CHECKED_CALL(cudaMalloc((void**)&data, BATCH_SIZE * 32));
+            CHECKED_CALL(hipMalloc((void**)&data, BATCH_SIZE * 32));
 	    
             uint64_t* kdata;
-            CHECKED_CALL(cudaMalloc((void**)&kdata, BATCH_SIZE * EXPANDBUF));
+            CHECKED_CALL(hipMalloc((void**)&kdata, BATCH_SIZE * EXPANDBUF));
 
             uint8_t* patterns;
-            CHECKED_CALL(cudaMalloc((void**)&patterns, patterns_str.length()));
-            CHECKED_CALL(cudaMemcpy(patterns, patterns_str.data(), patterns_str.length(), cudaMemcpyHostToDevice));
+            CHECKED_CALL(hipMalloc((void**)&patterns, patterns_str.length()));
+            CHECKED_CALL(hipMemcpy(patterns, patterns_str.data(), patterns_str.length(), hipMemcpyHostToDevice));
 
             uint32_t* results_key;
-            CHECKED_CALL(cudaMalloc((void**)&results_key, 256 * sizeof(uint32_t)));
+            CHECKED_CALL(hipMalloc((void**)&results_key, 256 * sizeof(uint32_t)));
 	    uint32_t* results_ctr;
-            CHECKED_CALL(cudaMalloc((void**)&results_ctr, 256 * sizeof(uint32_t)));
+            CHECKED_CALL(hipMalloc((void**)&results_ctr, 256 * sizeof(uint32_t)));
 
             for (uint64_t offset = 0;; offset += BATCH_SIZE) {
-                CHECKED_CALL(cudaMemset(results_key, 0, sizeof(uint32_t)));
+                CHECKED_CALL(hipMemset(results_key, 0, sizeof(uint32_t)));
 
                 gpu::keccak_12_rounds<<<BATCH_SIZE, 32>>>(input_buf, 32, offset, data);
-                CHECKED_CALL(cudaGetLastError());
+                CHECKED_CALL(hipGetLastError());
 		
                 gpu::reduce<<<BATCH_SIZE / 32, 32>>>(data);
-                CHECKED_CALL(cudaGetLastError());
+                CHECKED_CALL(hipGetLastError());
 		
                 gpu::gen_public_keys_primary<<<BATCH_SIZE / 32, 32>>>(data, kdata);
-                CHECKED_CALL(cudaGetLastError());
+                CHECKED_CALL(hipGetLastError());
 
 		// TODO: add in a conditional to switch to this kernel the majority of the time once Primary has run at least once
 		//gpu::gen_public_keys_secondary<<<BATCH_SIZE / 32, 32>>>(data, kdata);
-                //CHECKED_CALL(cudaGetLastError());
+                //CHECKED_CALL(hipGetLastError());
 
                 gpu::prefix_scan<<<BATCH_SIZE / 32, 32>>>(patterns, patterns_str.length() / PATTERN_SIZE, kdata, results_key, results_ctr);
-                CHECKED_CALL(cudaGetLastError());
+                CHECKED_CALL(hipGetLastError());
 
-                CHECKED_CALL(cudaDeviceSynchronize());
+                CHECKED_CALL(hipDeviceSynchronize());
 
                 uint32_t results_key_host[256];
-                CHECKED_CALL(cudaMemcpy(results_key_host, results_key, sizeof(results_key_host), cudaMemcpyDeviceToHost));
+                CHECKED_CALL(hipMemcpy(results_key_host, results_key, sizeof(results_key_host), hipMemcpyDeviceToHost));
                 uint32_t results_ctr_host[256];
-                CHECKED_CALL(cudaMemcpy(results_ctr_host, results_ctr, sizeof(results_ctr_host), cudaMemcpyDeviceToHost));
+                CHECKED_CALL(hipMemcpy(results_ctr_host, results_ctr, sizeof(results_ctr_host), hipMemcpyDeviceToHost));
 		
 		uint32_t counter = 0;
                 for (uint32_t i = 1, n = std::min(255u, results_key_host[0]); i <= n; ++i) {
